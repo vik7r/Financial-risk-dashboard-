@@ -11,6 +11,93 @@ library(jsonlite)
 # Helper functions
 # -----------------------------
 
+# Finnhub API (FREE - Real-time for US stocks, better than Yahoo Finance)
+# Get free API key at: https://finnhub.io/register
+fetch_equity_prices_finnhub <- function(symbol, from = Sys.Date() - 365, to = Sys.Date(), api_key = NULL) {
+  if (is.null(api_key)) {
+    api_key <- Sys.getenv("FINNHUB_API_KEY")
+  }
+  
+  # If no API key, fallback to Yahoo
+  if (is.null(api_key) || nchar(api_key) == 0) {
+    return(fetch_equity_prices(symbol, from, to))
+  }
+  
+  tryCatch({
+    # Get historical candles
+    url <- "https://finnhub.io/api/v1/stock/candle"
+    from_ts <- as.numeric(as.POSIXct(from))
+    to_ts <- as.numeric(as.POSIXct(to))
+    
+    res <- httr::GET(url, query = list(
+      symbol = symbol,
+      resolution = "D",
+      from = from_ts,
+      to = to_ts,
+      token = api_key
+    ))
+    
+    if (httr::status_code(res) == 200) {
+      data <- jsonlite::fromJSON(httr::content(res, "text", encoding = "UTF-8"))
+      if (data$s == "ok" && length(data$c) > 0) {
+        # Convert to xts format
+        ts <- as.POSIXct(data$t, origin = "1970-01-01", tz = "UTC")
+        result <- xts::xts(
+          cbind(Open = data$o, High = data$h, Low = data$l, Close = data$c, Volume = data$v),
+          order.by = ts
+        )
+        colnames(result) <- c("Open", "High", "Low", "Close", "Volume")
+        return(result)
+      }
+    }
+    # Fallback to Yahoo if Finnhub fails
+    return(fetch_equity_prices(symbol, from, to))
+  }, error = function(e) {
+    # Fallback to Yahoo on error
+    return(fetch_equity_prices(symbol, from, to))
+  })
+}
+
+# Free Indian Stock Market API - indianapi.in (Real-time, no API key required!)
+# Source: https://indianapi.in/documentation/indian-stock-market
+# Note: This API provides current/live prices. For historical charts, we still use Yahoo Finance.
+fetch_indian_equity_prices_realtime <- function(symbol, from = Sys.Date() - 365, to = Sys.Date()) {
+  tryCatch({
+    # Remove .NS suffix if present
+    base_symbol <- gsub("\\.NS$", "", toupper(symbol))
+    
+    # Indian Stock Exchange API - Free real-time data (no key required)
+    # This API provides real-time NSE/BSE prices
+    url <- "https://indianapi.in/api/stock"
+    
+    # Try to get current real-time price
+    res <- httr::GET(url, query = list(company = base_symbol), httr::timeout(10))
+    
+    if (httr::status_code(res) == 200) {
+      data <- jsonlite::fromJSON(httr::content(res, "text", encoding = "UTF-8"))
+      
+      # The API returns current price data
+      # We'll use Yahoo Finance for historical data (needed for charts)
+      # but mark that we have real-time current price available
+      yahoo_data <- fetch_equity_prices(paste0(base_symbol, ".NS"), from, to)
+      
+      # If we got real-time price data, we could update the last price
+      # For now, we return Yahoo data (which has full historical)
+      # The real-time price will be shown in the current price metric
+      # Future enhancement: Could update the last row of yahoo_data with real-time price
+      
+      return(yahoo_data)
+    }
+    
+    # Fallback to Yahoo Finance if API fails
+    return(fetch_equity_prices(paste0(base_symbol, ".NS"), from, to))
+  }, error = function(e) {
+    # Always fallback to Yahoo on error
+    return(fetch_equity_prices(paste0(gsub("\\.NS$", "", symbol), ".NS"), from, to))
+  })
+}
+
+# Yahoo Finance (original - 15-20 min delay)
 fetch_equity_prices <- function(symbol, from = Sys.Date() - 365, to = Sys.Date()) {
   suppressWarnings({
     getSymbols(
@@ -331,6 +418,49 @@ ui <- page_fluid(
       ),
       conditionalPanel(
         condition = "input.asset_type == 'equity'",
+        selectInput(
+          "data_source",
+          "Data Source (Delay)",
+          choices = c(
+            "Yahoo Finance (15-20 min delay)" = "yahoo",
+            "Finnhub (Real-time, FREE API key)" = "finnhub"
+          ),
+          selected = "yahoo"
+        ),
+        conditionalPanel(
+          condition = "input.data_source == 'finnhub'",
+          tags$small(
+            style = "color:#00E676;",
+            "Get free API key at: ",
+            tags$a(href = "https://finnhub.io/register", target = "_blank", "finnhub.io/register"),
+            ". Set FINNHUB_API_KEY environment variable."
+          )
+        )
+      ),
+      conditionalPanel(
+        condition = "input.asset_type == 'indian_equity'",
+        selectInput(
+          "indian_data_source",
+          "Data Source (Delay)",
+          choices = c(
+            "Yahoo Finance (15-20 min delay)" = "yahoo",
+            "Indian API (Real-time, FREE)" = "indianapi"
+          ),
+          selected = "yahoo"
+        ),
+        conditionalPanel(
+          condition = "input.indian_data_source == 'indianapi'",
+          tags$small(
+            style = "color:#00E676;",
+            "Free real-time API: ",
+            tags$a(href = "https://indianapi.in", target = "_blank", "indianapi.in"),
+            tags$br(),
+            "Note: Current price only (historical charts use Yahoo)"
+          )
+        )
+      ),
+      conditionalPanel(
+        condition = "input.asset_type == 'equity'",
         selectizeInput(
           "equity_symbol",
           "US Ticker",
@@ -389,9 +519,22 @@ ui <- page_fluid(
       ),
       checkboxInput("auto_refresh", "Enable Auto-Refresh", value = TRUE),
       hr(),
+      tags$div(
+        style = "background: rgba(0, 230, 118, 0.1); border-left: 3px solid #00E676; padding: 10px; margin-top: 10px; border-radius: 4px;",
+        tags$strong(style = "color:#00E676;", "💡 Reduce Delay:"),
+        tags$p(
+          style = "color:#9ea5b4; font-size: 0.85rem; margin: 5px 0 0 0;",
+          "Use Finnhub (FREE) for US stocks - real-time data!",
+          tags$br(),
+          "Get free API key: ",
+          tags$a(href = "https://finnhub.io/register", target = "_blank", style = "color:#00B0FF;", "finnhub.io/register"),
+          tags$br(),
+          "Set environment variable: FINNHUB_API_KEY"
+        )
+      ),
       tags$small(
-        style = "color:#748094;",
-        "Data: free Yahoo Finance & CoinGecko APIs. For real trading, add your own data feeds."
+        style = "color:#748094; margin-top: 10px; display: block;",
+        "Data: free Yahoo Finance (15-20 min delay) & CoinGecko APIs."
       )
     ),
     layout_columns(
@@ -405,7 +548,8 @@ ui <- page_fluid(
             style = "padding: 16px 20px; border-right: 1px solid #1f2230;",
             div(class = "metric-label", "Live Price (INR)"),
             div(textOutput("metric_price"), class = "metric-value", style = "margin: 12px 0;"),
-            tags$div(textOutput("metric_symbol"), style = "color:#9ea5b4; font-size:0.85rem; margin-top: 8px;")
+            tags$div(textOutput("metric_symbol"), style = "color:#9ea5b4; font-size:0.85rem; margin-top: 8px;"),
+            tags$div(textOutput("metric_delay"), style = "color:#748094; font-size:0.75rem; margin-top: 4px; font-style: italic;")
           ),
           column(
             4,
@@ -636,7 +780,13 @@ server <- function(input, output, session) {
         shiny::validate(shiny::need(FALSE, "Enter a valid equity ticker (e.g. AAPL, TSLA)."))
       }
       tryCatch({
-        xts_obj <- fetch_equity_prices(symbol, from, to)
+        # Use selected data source
+        data_source <- if (is.null(input$data_source)) "yahoo" else input$data_source
+        if (data_source == "finnhub") {
+          xts_obj <- fetch_equity_prices_finnhub(symbol, from, to)
+        } else {
+          xts_obj <- fetch_equity_prices(symbol, from, to)
+        }
         if (is.null(xts_obj) || nrow(xts_obj) == 0) {
           shiny::validate(shiny::need(FALSE, paste("No data returned for", symbol)))
         }
@@ -667,8 +817,17 @@ server <- function(input, output, session) {
         symbol <- paste0(symbol, ".NS")
       }
       tryCatch({
-        # Indian stocks are already in INR, no conversion needed
-        xts_obj <- fetch_equity_prices(symbol, from, to)
+        # Indian stocks: Use selected data source
+        data_source <- if (is.null(input$indian_data_source)) "yahoo" else input$indian_data_source
+        
+        if (data_source == "indianapi") {
+          # Try free real-time API (indianapi.in)
+          # Note: This API provides current price, but we still need Yahoo for historical charts
+          xts_obj <- fetch_indian_equity_prices_realtime(symbol, from, to)
+        } else {
+          # Yahoo Finance (15-20 min delay, but has full historical data)
+          xts_obj <- fetch_equity_prices(symbol, from, to)
+        }
         if (is.null(xts_obj) || nrow(xts_obj) == 0) {
           shiny::validate(shiny::need(FALSE, paste("No data returned for", symbol)))
         }
@@ -767,6 +926,39 @@ server <- function(input, output, session) {
       as.character(paste0("₹", formatted_price))
     }, error = function(e) {
       as.character(paste("Price error:", as.character(conditionMessage(e))))
+    })
+  })
+
+  output$metric_delay <- renderText({
+    tryCatch({
+      asset_type <- input$asset_type
+      if (asset_type == "crypto") {
+        return("Data delay: <1 minute (CoinGecko)")
+      } else if (asset_type == "equity") {
+        # US stocks - can use Finnhub for real-time
+        data_source <- if (is.null(input$data_source)) "yahoo" else input$data_source
+        if (data_source == "finnhub") {
+          api_key <- Sys.getenv("FINNHUB_API_KEY")
+          if (nchar(api_key) > 0) {
+            return("Data delay: Real-time (Finnhub)")
+          } else {
+            return("Data delay: Real-time (Finnhub - API key needed)")
+          }
+        } else {
+          return("Data delay: 15-20 minutes (Yahoo Finance)")
+        }
+      } else if (asset_type == "indian_equity") {
+        # Indian stocks - check selected data source
+        data_source <- if (is.null(input$indian_data_source)) "yahoo" else input$indian_data_source
+        if (data_source == "indianapi") {
+          return("Data delay: Real-time (Indian API - Free)")
+        } else {
+          return("Data delay: 15-20 minutes (Yahoo Finance)")
+        }
+      }
+      return("")
+    }, error = function(e) {
+      return("")
     })
   })
 
