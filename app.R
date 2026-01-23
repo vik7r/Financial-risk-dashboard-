@@ -8,8 +8,26 @@ library(httr)
 library(jsonlite)
 
 # -----------------------------
+# SSL Configuration for Windows
+# -----------------------------
+# Fix Windows SSL certificate issues by disabling SSL verification
+# This is necessary on many Windows systems where SSL certificates
+# are not properly configured in R's certificate store
+if (.Platform$OS.type == "windows") {
+  # Set global SSL config to handle Windows certificate issues
+  # This is a workaround for SEC_E_NO_CREDENTIALS errors
+  httr::set_config(httr::config(ssl_verifypeer = FALSE, ssl_verifyhost = FALSE))
+}
+
+# -----------------------------
 # Helper functions
 # -----------------------------
+
+# Alpha Vantage API (FREE - More reliable than Yahoo Finance, no blocking)
+# NOTE: Alpha Vantage has rate limits. For development, Yahoo/Finnhub may be better
+fetch_equity_prices_alphavantage <- function(symbol, from = Sys.Date() - 365, to = Sys.Date()) {
+  stop("Alpha Vantage disabled - please use Finnhub or Yahoo Finance instead. Alpha Vantage has strict rate limits (5 requests/min without key).")
+}
 
 # Finnhub API (FREE - Real-time for US stocks, better than Yahoo Finance)
 # Get free API key at: https://finnhub.io/register
@@ -18,8 +36,14 @@ fetch_equity_prices_finnhub <- function(symbol, from = Sys.Date() - 365, to = Sy
     api_key <- Sys.getenv("FINNHUB_API_KEY")
   }
   
-  # If no API key, fallback to Yahoo
+  # If no API key, fallback to Yahoo with clear message
   if (is.null(api_key) || nchar(api_key) == 0) {
+    cat("[INFO] Finnhub API key not set - falling back to Yahoo Finance\n")
+    cat("[INFO] To get real-time data:\n")
+    cat("[INFO] 1. Sign up at https://finnhub.io/register (FREE, 2 minutes)\n")
+    cat("[INFO] 2. Copy your API key\n")
+    cat("[INFO] 3. Run: Sys.setenv(FINNHUB_API_KEY='your_key_here')\n")
+    cat("[INFO] 4. Reload the app\n")
     return(fetch_equity_prices(symbol, from, to))
   }
   
@@ -29,13 +53,25 @@ fetch_equity_prices_finnhub <- function(symbol, from = Sys.Date() - 365, to = Sy
     from_ts <- as.numeric(as.POSIXct(from))
     to_ts <- as.numeric(as.POSIXct(to))
     
+    # On Windows, use relaxed SSL verification to avoid certificate issues
+    ssl_config <- if (.Platform$OS.type == "windows") {
+      httr::config(ssl_verifypeer = FALSE, ssl_verifyhost = FALSE)
+    } else {
+      httr::config()
+    }
     res <- httr::GET(url, query = list(
       symbol = symbol,
       resolution = "D",
       from = from_ts,
       to = to_ts,
       token = api_key
-    ))
+    ), httr::timeout(60),  # Increased from 30 to 60 seconds
+       httr::user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+       httr::add_headers(
+         "Accept-Language" = "en-US,en;q=0.9",
+         "Cache-Control" = "no-cache"
+       ),
+       ssl_config)
     
     if (httr::status_code(res) == 200) {
       data <- jsonlite::fromJSON(httr::content(res, "text", encoding = "UTF-8"))
@@ -60,7 +96,7 @@ fetch_equity_prices_finnhub <- function(symbol, from = Sys.Date() - 365, to = Sy
 
 # Free Indian Stock Market API - indianapi.in (Real-time, no API key required!)
 # Source: https://indianapi.in/documentation/indian-stock-market
-# Note: This API provides current/live prices. For historical charts, we still use Yahoo Finance.
+# Note: This API provides current/live prices. For historical charts, we use Yahoo Finance.
 fetch_indian_equity_prices_realtime <- function(symbol, from = Sys.Date() - 365, to = Sys.Date()) {
   tryCatch({
     # Remove .NS suffix if present
@@ -70,71 +106,192 @@ fetch_indian_equity_prices_realtime <- function(symbol, from = Sys.Date() - 365,
     # This API provides real-time NSE/BSE prices
     url <- "https://indianapi.in/api/stock"
     
-    # Try to get current real-time price
-    res <- httr::GET(url, query = list(company = base_symbol), httr::timeout(10))
-    
-    if (httr::status_code(res) == 200) {
-      data <- jsonlite::fromJSON(httr::content(res, "text", encoding = "UTF-8"))
-      
-      # The API returns current price data
-      # We'll use Yahoo Finance for historical data (needed for charts)
-      # but mark that we have real-time current price available
-      yahoo_data <- fetch_equity_prices(paste0(base_symbol, ".NS"), from, to)
-      
-      # If we got real-time price data, we could update the last price
-      # For now, we return Yahoo data (which has full historical)
-      # The real-time price will be shown in the current price metric
-      # Future enhancement: Could update the last row of yahoo_data with real-time price
-      
-      return(yahoo_data)
+    # On Windows, use relaxed SSL verification to avoid certificate issues
+    ssl_config <- if (.Platform$OS.type == "windows") {
+      httr::config(ssl_verifypeer = FALSE, ssl_verifyhost = FALSE)
+    } else {
+      httr::config()
     }
     
-    # Fallback to Yahoo Finance if API fails
-    return(fetch_equity_prices(paste0(base_symbol, ".NS"), from, to))
+    # Try to get current real-time price
+    res <- httr::GET(
+      url, 
+      query = list(company = base_symbol), 
+      httr::timeout(30),
+      httr::user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+      httr::add_headers(
+        "Accept-Language" = "en-US,en;q=0.9",
+        "Cache-Control" = "no-cache"
+      ),
+      ssl_config
+    )
+    
+    if (httr::status_code(res) != 200) {
+      cat("[WARN] Indian API returned status:", httr::status_code(res), "- falling back to Yahoo\n")
+      return(fetch_equity_prices(paste0(base_symbol, ".NS"), from, to))
+    }
+    
+    data <- jsonlite::fromJSON(httr::content(res, "text", encoding = "UTF-8"))
+    
+    # Get historical data from Yahoo for charts
+    yahoo_data <- fetch_equity_prices(paste0(base_symbol, ".NS"), from, to)
+    
+    # Try to get real-time price and update the last row
+    if (!is.null(data) && !is.null(data$price)) {
+      current_price <- as.numeric(data$price)
+      
+      # Update the last close price with current real-time price
+      if (!is.na(current_price) && nrow(yahoo_data) > 0) {
+        # Create a copy of yahoo data
+        result <- yahoo_data
+        
+        # Update the last row's Close price with real-time data
+        if ("Close" %in% colnames(result)) {
+          result[nrow(result), "Close"] <- current_price
+        } else if (ncol(result) >= 4) {
+          # If using OHLC format, update the Close column (typically 4th)
+          result[nrow(result), 4] <- current_price
+        }
+        
+        cat("[INFO] Updated with real-time price from Indian API:", current_price, "\n")
+        return(result)
+      }
+    }
+    
+    # Return Yahoo data as-is if real-time update failed
+    cat("[INFO] Using historical data from Yahoo Finance\n")
+    return(yahoo_data)
+    
   }, error = function(e) {
-    # Always fallback to Yahoo on error
-    return(fetch_equity_prices(paste0(gsub("\\.NS$", "", symbol), ".NS"), from, to))
+    # Fallback to Yahoo on error
+    tryCatch({
+      cat("[WARN] Indian API error:", as.character(conditionMessage(e)), "- trying Yahoo\n")
+      return(fetch_equity_prices(paste0(gsub("\\.NS$", "", symbol), ".NS"), from, to))
+    }, error = function(e2) {
+      # If Yahoo also fails, provide helpful error
+      stop(paste("Unable to fetch Indian stock data for", symbol,
+                 "\nBoth Indian API and Yahoo Finance failed.",
+                 "\n\nPossible causes:",
+                 "1. Check internet connection",
+                 "2. APIs may be temporarily unavailable",
+                 "3. Firewall/proxy blocking connections",
+                 "4. Try again in a few minutes",
+                 sep = "\n"))
+    })
   })
 }
 
 # Yahoo Finance (original - 15-20 min delay)
 fetch_equity_prices <- function(symbol, from = Sys.Date() - 365, to = Sys.Date()) {
-  suppressWarnings({
-    getSymbols(
-      Symbols = symbol,
-      src = "yahoo",
-      from = from,
-      to = to,
-      auto.assign = FALSE
-    )
+  tryCatch({
+    # Try using quantmod first (most reliable)
+    result <- suppressWarnings({
+      getSymbols(
+        Symbols = symbol,
+        src = "yahoo",
+        from = from,
+        to = to,
+        auto.assign = FALSE,
+        warnings = FALSE
+      )
+    })
+    
+    # Validate result
+    if (is.null(result) || nrow(result) == 0) {
+      stop("No data from Yahoo Finance")
+    }
+    
+    # Ensure proper column names
+    if (ncol(result) < 4) {
+      stop("Insufficient columns in data")
+    }
+    
+    return(result)
+  }, error = function(e) {
+    # If quantmod fails, provide helpful error
+    error_msg <- as.character(conditionMessage(e))
+    
+    if (grepl("401|403|blocked|Unauthorized", error_msg, ignore.case = TRUE)) {
+      stop(paste("❌ Yahoo Finance is blocking this request.",
+                 "\nTry Alpha Vantage or Finnhub instead (see dropdown menu).",
+                 "\nOr wait 10 minutes and try again.",
+                 sep = "\n"))
+    }
+    
+    stop(paste("Unable to fetch data for", symbol,
+               "\n\nError:", error_msg,
+               "\n\nSolutions:",
+               "1. Check internet connection",
+               "2. Try a different data source (Alpha Vantage, Finnhub)",
+               "3. Verify symbol is correct (e.g., AAPL, MSFT)",
+               sep = "\n"))
   })
 }
 
 fetch_crypto_prices <- function(symbol = "bitcoin", vs_currency = "inr", days = 365) {
-  # Simple CoinGecko integration (no key required)
-  url <- sprintf(
-    "https://api.coingecko.com/api/v3/coins/%s/market_chart",
-    symbol
-  )
-  res <- httr::GET(url, query = list(vs_currency = vs_currency, days = days))
-  httr::stop_for_status(res)
-  data <- jsonlite::fromJSON(httr::content(res, "text", encoding = "UTF-8"))
-  prices <- data$prices
-  if (is.null(prices) || nrow(prices) == 0) {
-    stop("No crypto price data returned.")
-  }
-  # prices: matrix/data.frame of [timestamp, price]
-  if (is.data.frame(prices)) {
-    price_vec <- prices[[2]]
-    ts_vec <- prices[[1]]
-  } else {
-    price_vec <- prices[, 2]
-    ts_vec <- prices[, 1]
-  }
-  ts <- as.POSIXct(ts_vec / 1000, origin = "1970-01-01", tz = "UTC")
-  result <- xts::xts(price_vec, order.by = ts)
-  colnames(result) <- "Close"
-  result
+  tryCatch({
+    # Simple CoinGecko integration (no key required)
+    url <- sprintf(
+      "https://api.coingecko.com/api/v3/coins/%s/market_chart",
+      symbol
+    )
+    
+    # Try with timeout and better error handling
+    # On Windows, use relaxed SSL verification to avoid certificate issues
+    ssl_config <- if (.Platform$OS.type == "windows") {
+      httr::config(ssl_verifypeer = FALSE, ssl_verifyhost = FALSE)
+    } else {
+      httr::config()
+    }
+    res <- httr::GET(
+      url, 
+      query = list(vs_currency = vs_currency, days = days),
+      httr::timeout(60),  # Increased from 30 to 60 seconds
+      httr::user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+      httr::add_headers(
+        "Accept-Language" = "en-US,en;q=0.9",
+        "Accept-Encoding" = "gzip, deflate"
+      ),
+      ssl_config
+    )
+    
+    # Check status
+    if (httr::status_code(res) != 200) {
+      stop(paste("CoinGecko API returned status", httr::status_code(res)))
+    }
+    
+    # Parse JSON
+    data <- jsonlite::fromJSON(httr::content(res, "text", encoding = "UTF-8"))
+    prices <- data$prices
+    
+    if (is.null(prices) || (is.data.frame(prices) && nrow(prices) == 0) || 
+        (is.matrix(prices) && nrow(prices) == 0)) {
+      stop("No crypto price data returned from CoinGecko")
+    }
+    
+    # prices: matrix/data.frame of [timestamp, price]
+    if (is.data.frame(prices)) {
+      price_vec <- prices[[2]]
+      ts_vec <- prices[[1]]
+    } else {
+      price_vec <- prices[, 2]
+      ts_vec <- prices[, 1]
+    }
+    
+    ts <- as.POSIXct(ts_vec / 1000, origin = "1970-01-01", tz = "UTC")
+    result <- xts::xts(price_vec, order.by = ts)
+    colnames(result) <- "Close"
+    result
+  }, error = function(e) {
+    err_msg <- conditionMessage(e)
+    stop(paste("CoinGecko API error for", symbol, ":", err_msg,
+               "\n\nPossible causes:",
+               "1. Check internet connection",
+               "2. CoinGecko API may be temporarily unavailable",
+               "3. Invalid crypto symbol (try: bitcoin, ethereum, etc.)",
+               "4. Firewall/proxy blocking connection",
+               sep = "\n"))
+  })
 }
 
 # Get USD to INR exchange rate
@@ -143,7 +300,23 @@ get_usd_to_inr_rate <- function() {
     # Using CoinGecko's simple price API for USD/INR (using a stablecoin as proxy)
     # Or use a free forex API
     url <- "https://api.coingecko.com/api/v3/simple/price"
-    res <- httr::GET(url, query = list(ids = "tether", vs_currencies = "inr"))
+    # On Windows, use relaxed SSL verification to avoid certificate issues
+    ssl_config <- if (.Platform$OS.type == "windows") {
+      httr::config(ssl_verifypeer = FALSE, ssl_verifyhost = FALSE)
+    } else {
+      httr::config()
+    }
+    res <- httr::GET(
+      url, 
+      query = list(ids = "tether", vs_currencies = "inr"),
+      httr::timeout(30),  # Increased from 15 to 30 seconds
+      httr::user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+      httr::add_headers(
+        "Accept-Language" = "en-US,en;q=0.9",
+        "Cache-Control" = "no-cache"
+      ),
+      ssl_config
+    )
     if (httr::status_code(res) == 200) {
       data <- jsonlite::fromJSON(httr::content(res, "text", encoding = "UTF-8"))
       if (!is.null(data$tether$inr)) {
@@ -356,64 +529,446 @@ ui <- page_fluid(
     tags$title("High-Frequency Financial Risk Dashboard"),
     tags$script(src = "https://s3.tradingview.com/tv.js"),
     tags$style(HTML("
-      body { background-color: #0b0c10; }
+      /* Modern Dark Theme with Glassmorphism */
+      body { 
+        background: #000000;
+        background-attachment: fixed;
+      }
+      
+      /* Animated Gradient Background */
+      body::before {
+        content: '';
+        position: fixed;
+        top: -50%;
+        left: -50%;
+        width: 200%;
+        height: 200%;
+        background: radial-gradient(circle, rgba(0,230,118,0.03) 0%, transparent 50%),
+                    radial-gradient(circle at 80% 80%, rgba(0,176,255,0.03) 0%, transparent 50%);
+        animation: gradientShift 15s ease infinite;
+        pointer-events: none;
+        z-index: 0;
+      }
+      
+      @keyframes gradientShift {
+        0%, 100% { transform: translate(0, 0) rotate(0deg); }
+        50% { transform: translate(5%, 5%) rotate(5deg); }
+      }
+      
+      /* Glass Cards with Liquid Effect */
       .card {
-        background-color: #14161f;
-        border-radius: 14px;
-        border: 1px solid #1f2230;
+        background: rgba(20, 22, 31, 0.7);
+        backdrop-filter: blur(20px) saturate(180%);
+        -webkit-backdrop-filter: blur(20px) saturate(180%);
+        border-radius: 20px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
         padding: 20px 24px;
         margin-bottom: 20px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3),
+                    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+        position: relative;
+        overflow: hidden;
+        transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
       }
+      
+      /* Liquid Glass Glow Effect */
+      .card::before {
+        content: '';
+        position: absolute;
+        top: -50%;
+        left: -50%;
+        width: 200%;
+        height: 200%;
+        background: radial-gradient(circle, rgba(0,230,118,0.1) 0%, transparent 70%);
+        opacity: 0;
+        transition: opacity 0.6s ease;
+        pointer-events: none;
+      }
+      
+      .card:hover::before {
+        opacity: 1;
+      }
+      
+      .card:hover {
+        transform: translateY(-2px);
+        border-color: rgba(0, 230, 118, 0.3);
+        box-shadow: 0 12px 40px rgba(0, 230, 118, 0.15),
+                    0 8px 32px rgba(0, 0, 0, 0.4),
+                    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+      }
+      
       .card h5 {
         margin-bottom: 16px;
         color: #ffffff;
         font-weight: 600;
         font-size: 1.1rem;
+        text-shadow: 0 2px 8px rgba(0,230,118,0.3);
       }
+      
+      /* Metric Values with Glow */
       .metric-value {
         font-size: 2rem;
         font-weight: 700;
-        color: #ffffff;
+        background: linear-gradient(135deg, #ffffff 0%, #00E676 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
         line-height: 1.2;
         word-break: break-word;
+        filter: drop-shadow(0 2px 8px rgba(0,230,118,0.3));
       }
+      
       .metric-label {
         font-size: 0.9rem;
         text-transform: uppercase;
-        letter-spacing: 0.1em;
+        letter-spacing: 0.15em;
         color: #9ea5b4;
-        font-weight: 500;
+        font-weight: 600;
         margin-bottom: 4px;
       }
+      
+      /* Glassmorphic Badges */
       .soft-badge {
-        background: rgba(0, 230, 118, 0.1);
+        background: linear-gradient(135deg, rgba(0,230,118,0.15) 0%, rgba(0,176,255,0.15) 100%);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(0,230,118,0.3);
         border-radius: 999px;
-        padding: 4px 10px;
+        padding: 6px 14px;
         font-size: 0.75rem;
         color: #00e676;
+        font-weight: 600;
+        letter-spacing: 0.05em;
+        box-shadow: 0 4px 12px rgba(0,230,118,0.2),
+                    inset 0 1px 0 rgba(255,255,255,0.1);
       }
-      #tradingview_widget {
-        background-color: #14161f;
+      
+      /* Modern Select Inputs with Glassmorphism */
+      .form-select, .selectize-input, input[type='text'], input[type='number'] {
+        background: rgba(31, 34, 48, 0.6) !important;
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255, 255, 255, 0.1) !important;
+        border-radius: 12px !important;
+        color: #ffffff !important;
+        padding: 10px 16px !important;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.2);
+      }
+      
+      .form-select:hover, .selectize-input:hover, input[type='text']:hover, input[type='number']:hover {
+        border-color: rgba(0, 230, 118, 0.4) !important;
+        background: rgba(31, 34, 48, 0.8) !important;
+        box-shadow: 0 0 0 3px rgba(0, 230, 118, 0.1),
+                    inset 0 2px 8px rgba(0, 0, 0, 0.2);
+      }
+      
+      .form-select:focus, .selectize-input.focus, input:focus {
+        border-color: rgba(0, 230, 118, 0.6) !important;
+        background: rgba(31, 34, 48, 0.9) !important;
+        box-shadow: 0 0 0 4px rgba(0, 230, 118, 0.15),
+                    0 4px 16px rgba(0, 230, 118, 0.2),
+                    inset 0 2px 8px rgba(0, 0, 0, 0.2) !important;
+        outline: none !important;
+      }
+      
+      /* Selectize Dropdown - Advanced Design */
+      .selectize-dropdown {
+        background: rgba(20, 22, 31, 0.95) !important;
+        backdrop-filter: blur(20px) saturate(180%);
+        border: 1px solid rgba(255, 255, 255, 0.1) !important;
+        border-radius: 12px !important;
+        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5),
+                    0 0 0 1px rgba(0, 230, 118, 0.1) !important;
+        margin-top: 8px;
+        padding: 8px;
+      }
+      
+      .selectize-dropdown-content {
+        max-height: 300px;
+        overflow-y: auto;
+      }
+      
+      .selectize-dropdown-content::-webkit-scrollbar {
+        width: 8px;
+      }
+      
+      .selectize-dropdown-content::-webkit-scrollbar-track {
+        background: rgba(255, 255, 255, 0.02);
+        border-radius: 4px;
+      }
+      
+      .selectize-dropdown-content::-webkit-scrollbar-thumb {
+        background: linear-gradient(180deg, rgba(0,230,118,0.3), rgba(0,176,255,0.3));
+        border-radius: 4px;
+      }
+      
+      .selectize-dropdown .option {
+        padding: 10px 14px;
         border-radius: 8px;
+        margin: 2px 0;
+        transition: all 0.2s ease;
+        color: #9ea5b4;
+      }
+      
+      .selectize-dropdown .option:hover,
+      .selectize-dropdown .option.active {
+        background: linear-gradient(135deg, rgba(0,230,118,0.15), rgba(0,176,255,0.1));
+        color: #00E676 !important;
+        transform: translateX(4px);
+        box-shadow: 0 4px 12px rgba(0,230,118,0.2);
+      }
+      
+      .selectize-dropdown .option.selected {
+        background: rgba(0,230,118,0.1);
+        color: #00E676;
+      }
+      
+      /* Slider Inputs - Modern Glow */
+      .irs {
+        font-family: 'Inter', sans-serif;
+      }
+      
+      .irs--shiny .irs-bar {
+        background: linear-gradient(90deg, #00E676, #00B0FF) !important;
+        border: none !important;
+        box-shadow: 0 2px 8px rgba(0,230,118,0.4);
+      }
+      
+      .irs--shiny .irs-handle {
+        background: linear-gradient(135deg, #00E676, #00B0FF) !important;
+        border: 2px solid rgba(255,255,255,0.3) !important;
+        box-shadow: 0 4px 12px rgba(0,230,118,0.5),
+                    0 0 0 4px rgba(0,230,118,0.1);
+        transition: all 0.3s ease;
+      }
+      
+      .irs--shiny .irs-handle:hover {
+        transform: scale(1.1);
+        box-shadow: 0 6px 16px rgba(0,230,118,0.6),
+                    0 0 0 6px rgba(0,230,118,0.15);
+      }
+      
+      .irs--shiny .irs-from, .irs--shiny .irs-to, .irs--shiny .irs-single {
+        background: linear-gradient(135deg, rgba(0,230,118,0.9), rgba(0,176,255,0.9)) !important;
+        border-radius: 8px;
+        padding: 4px 10px;
+        font-weight: 600;
+        box-shadow: 0 4px 12px rgba(0,230,118,0.3);
+      }
+      
+      /* Checkbox - Liquid Glass Toggle */
+      .form-check-input {
+        width: 48px;
+        height: 24px;
+        background: rgba(31, 34, 48, 0.6);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 12px;
+        cursor: pointer;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      }
+      
+      .form-check-input:checked {
+        background: linear-gradient(135deg, #00E676, #00B0FF);
+        border-color: rgba(0, 230, 118, 0.5);
+        box-shadow: 0 0 0 4px rgba(0, 230, 118, 0.15),
+                    0 4px 12px rgba(0, 230, 118, 0.4),
+                    inset 0 1px 0 rgba(255,255,255,0.2);
+      }
+      
+      /* Tab Pills - Advanced Design */
+      .nav-pills .nav-link {
+        background: rgba(31, 34, 48, 0.4);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: 12px;
+        color: #9ea5b4;
+        padding: 10px 20px;
+        margin: 0 6px;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        font-weight: 500;
+        position: relative;
+        overflow: hidden;
+      }
+      
+      .nav-pills .nav-link::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: -100%;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(0,230,118,0.1), transparent);
+        transition: left 0.5s ease;
+      }
+      
+      .nav-pills .nav-link:hover::before {
+        left: 100%;
+      }
+      
+      .nav-pills .nav-link:hover {
+        background: rgba(31, 34, 48, 0.7);
+        border-color: rgba(0, 230, 118, 0.3);
+        color: #00E676;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0,230,118,0.2);
+      }
+      
+      .nav-pills .nav-link.active {
+        background: linear-gradient(135deg, rgba(0,230,118,0.2), rgba(0,176,255,0.15));
+        border-color: rgba(0, 230, 118, 0.5);
+        color: #00E676;
+        box-shadow: 0 4px 16px rgba(0,230,118,0.3),
+                    inset 0 1px 0 rgba(255,255,255,0.1);
+        font-weight: 600;
+      }
+      
+      /* Sidebar - Glass Effect */
+      .sidebar {
+        background: rgba(20, 22, 31, 0.8) !important;
+        backdrop-filter: blur(20px) saturate(180%);
+        border-right: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 4px 0 24px rgba(0, 0, 0, 0.2);
+      }
+      
+      /* Buttons with Liquid Glow */
+      .btn, button {
+        background: linear-gradient(135deg, rgba(0,230,118,0.15), rgba(0,176,255,0.15));
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(0,230,118,0.3);
+        border-radius: 12px;
+        color: #00E676;
+        padding: 10px 24px;
+        font-weight: 600;
+        letter-spacing: 0.05em;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        position: relative;
+        overflow: hidden;
+      }
+      
+      .btn::before {
+        content: '';
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 0;
+        height: 0;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(0,230,118,0.3), transparent);
+        transform: translate(-50%, -50%);
+        transition: width 0.6s ease, height 0.6s ease;
+      }
+      
+      .btn:hover::before {
+        width: 300px;
+        height: 300px;
+      }
+      
+      .btn:hover {
+        background: linear-gradient(135deg, rgba(0,230,118,0.25), rgba(0,176,255,0.25));
+        border-color: rgba(0,230,118,0.5);
+        box-shadow: 0 0 0 4px rgba(0,230,118,0.1),
+                    0 8px 24px rgba(0,230,118,0.3);
+        transform: translateY(-2px);
+      }
+      
+      .btn:active {
+        transform: translateY(0) scale(0.98);
+      }
+      
+      /* HR Dividers */
+      hr {
+        border-color: rgba(255, 255, 255, 0.08);
+        opacity: 1;
+      }
+      
+      /* Links */
+      a {
+        color: #00B0FF;
+        text-decoration: none;
+        transition: all 0.3s ease;
+        position: relative;
+      }
+      
+      a::after {
+        content: '';
+        position: absolute;
+        bottom: -2px;
+        left: 0;
+        width: 0;
+        height: 2px;
+        background: linear-gradient(90deg, #00E676, #00B0FF);
+        transition: width 0.3s ease;
+      }
+      
+      a:hover::after {
+        width: 100%;
+      }
+      
+      a:hover {
+        color: #00E676;
+        text-shadow: 0 0 8px rgba(0,230,118,0.5);
+      }
+      
+      /* Code blocks */
+      code {
+        background: rgba(0,230,118,0.1);
+        border: 1px solid rgba(0,230,118,0.2);
+        border-radius: 6px;
+        padding: 2px 8px;
+        color: #00E676;
+        font-family: 'Fira Code', monospace;
+      }
+      
+      /* Scrollbar Styling */
+      ::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+      
+      ::-webkit-scrollbar-track {
+        background: rgba(20, 22, 31, 0.5);
+      }
+      
+      ::-webkit-scrollbar-thumb {
+        background: linear-gradient(180deg, rgba(0,230,118,0.3), rgba(0,176,255,0.3));
+        border-radius: 5px;
+        border: 2px solid rgba(20, 22, 31, 0.5);
+      }
+      
+      ::-webkit-scrollbar-thumb:hover {
+        background: linear-gradient(180deg, rgba(0,230,118,0.5), rgba(0,176,255,0.5));
+      }
+      
+      #tradingview_widget {
+        background-color: rgba(20, 22, 31, 0.7);
+        backdrop-filter: blur(20px);
+        border-radius: 20px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      
+      /* Smooth Animations */
+      * {
+        transition: background-color 0.3s ease, border-color 0.3s ease;
       }
     "))
   ),
   layout_sidebar(
     sidebar = sidebar(
-      width = 300,
-      h4("Controls"),
+      width = 280,
+      open = "open",
+      h4("Controls", style = "margin-bottom: 8px;"),
       tags$small(
-        style = "color:#9ea5b4;",
-        "Configure assets and risk parameters. Data auto-refreshes for a high-frequency feel."
+        style = "color:#9ea5b4; font-size: 0.8rem;",
+        "Configure assets & risk parameters"
       ),
-      hr(),
+      hr(style = "margin: 8px 0;"),
       selectInput(
         "asset_type",
         "Asset Type",
         choices = c(
-          "US Equity (Yahoo Finance)" = "equity",
-          "Indian Equity (NSE)" = "indian_equity",
-          "Crypto (CoinGecko)" = "crypto"
+          "US Equity" = "equity",
+          "Indian Equity" = "indian_equity",
+          "Crypto" = "crypto"
         )
       ),
       conditionalPanel(
@@ -422,18 +977,30 @@ ui <- page_fluid(
           "data_source",
           "Data Source (Delay)",
           choices = c(
-            "Yahoo Finance (15-20 min delay)" = "yahoo",
-            "Finnhub (Real-time, FREE API key)" = "finnhub"
+            "Finnhub (Real-time, FREE - Recommended)" = "finnhub",
+            "Yahoo Finance (15-20 min delay)" = "yahoo"
           ),
-          selected = "yahoo"
+          selected = "finnhub"
         ),
         conditionalPanel(
           condition = "input.data_source == 'finnhub'",
           tags$small(
             style = "color:#00E676;",
-            "Get free API key at: ",
+            "✓ Real-time prices (no delay) - FREE!",
+            tags$br(),
+            "Don't have API key? Get one at: ",
             tags$a(href = "https://finnhub.io/register", target = "_blank", "finnhub.io/register"),
-            ". Set FINNHUB_API_KEY environment variable."
+            " (takes 2 minutes)",
+            tags$br(),
+            "Then set environment variable: ",
+            tags$code("FINNHUB_API_KEY=your_key_here")
+          )
+        ),
+        conditionalPanel(
+          condition = "input.data_source == 'yahoo'",
+          tags$small(
+            style = "color:#FF9800;",
+            "⚠ Yahoo Finance has 15-20 minute delay - use Finnhub for live prices"
           )
         )
       ),
@@ -443,19 +1010,27 @@ ui <- page_fluid(
           "indian_data_source",
           "Data Source (Delay)",
           choices = c(
-            "Yahoo Finance (15-20 min delay)" = "yahoo",
-            "Indian API (Real-time, FREE)" = "indianapi"
+            "Indian API (Real-time, FREE - Recommended)" = "indianapi",
+            "Yahoo Finance (15-20 min delay)" = "yahoo"
           ),
-          selected = "yahoo"
+          selected = "indianapi"
         ),
         conditionalPanel(
           condition = "input.indian_data_source == 'indianapi'",
           tags$small(
             style = "color:#00E676;",
-            "Free real-time API: ",
-            tags$a(href = "https://indianapi.in", target = "_blank", "indianapi.in"),
+            "✓ Real-time NSE/BSE prices (no delay) - FREE!",
             tags$br(),
-            "Note: Current price only (historical charts use Yahoo)"
+            "Works for all Indian stocks (TCS, RELIANCE, INFY, etc.)",
+            tags$br(),
+            "Note: Current price only - historical charts use Yahoo fallback"
+          )
+        ),
+        conditionalPanel(
+          condition = "input.indian_data_source == 'yahoo'",
+          tags$small(
+            style = "color:#FF9800;",
+            "⚠ Yahoo Finance has 15-20 minute delay - use Indian API for live prices"
           )
         )
       ),
@@ -494,12 +1069,12 @@ ui <- page_fluid(
       ),
       sliderInput(
         "lookback_days",
-        "Lookback Window (days)",
+        "Lookback (days)",
         min = 60, max = 730, value = 365, step = 30
       ),
       sliderInput(
         "var_confidence",
-        "VaR Confidence Level",
+        "VaR Confidence",
         min = 0.90, max = 0.99, value = 0.95, step = 0.01
       ),
       sliderInput(
@@ -509,61 +1084,58 @@ ui <- page_fluid(
       ),
       sliderInput(
         "mc_sims",
-        "Monte Carlo Simulations",
+        "MC Simulations",
         min = 1000, max = 20000, value = 5000, step = 1000
       ),
       sliderInput(
         "refresh_secs",
-        "Auto-Refresh (seconds)",
+        "Refresh (sec)",
         min = 10, max = 300, value = 60, step = 10
       ),
-      checkboxInput("auto_refresh", "Enable Auto-Refresh", value = TRUE),
-      hr(),
+      checkboxInput("auto_refresh", "Auto-Refresh", value = TRUE),
+      hr(style = "margin: 8px 0;"),
       tags$div(
-        style = "background: rgba(0, 230, 118, 0.1); border-left: 3px solid #00E676; padding: 10px; margin-top: 10px; border-radius: 4px;",
-        tags$strong(style = "color:#00E676;", "💡 Reduce Delay:"),
+        style = "background: rgba(0, 230, 118, 0.08); border-left: 2px solid #00E676; padding: 6px 8px; margin-top: 8px; border-radius: 3px;",
+        tags$strong(style = "color:#00E676; font-size: 0.8rem;", "💡 Real-time Data:"),
         tags$p(
-          style = "color:#9ea5b4; font-size: 0.85rem; margin: 5px 0 0 0;",
-          "Use Finnhub (FREE) for US stocks - real-time data!",
+          style = "color:#9ea5b4; font-size: 0.75rem; margin: 3px 0 0 0;",
+          "Finnhub (FREE) for US stocks",
           tags$br(),
-          "Get free API key: ",
-          tags$a(href = "https://finnhub.io/register", target = "_blank", style = "color:#00B0FF;", "finnhub.io/register"),
-          tags$br(),
-          "Set environment variable: FINNHUB_API_KEY"
+          tags$a(href = "https://finnhub.io/register", target = "_blank", style = "color:#00B0FF;", "Get API key")
         )
       ),
       tags$small(
-        style = "color:#748094; margin-top: 10px; display: block;",
-        "Data: free Yahoo Finance (15-20 min delay) & CoinGecko APIs."
+        style = "color:#748094; margin-top: 8px; display: block; font-size: 0.7rem;",
+        "Data: Yahoo Finance & CoinGecko APIs"
       )
     ),
     layout_columns(
       col_widths = c(12),
       div(
         class = "card",
-        style = "padding: 24px 28px;",
+        style = "padding: 16px 20px;",
         fluidRow(
           column(
             4,
-            style = "padding: 16px 20px; border-right: 1px solid #1f2230;",
-            div(class = "metric-label", "Live Price (INR)"),
-            div(textOutput("metric_price"), class = "metric-value", style = "margin: 12px 0;"),
-            tags$div(textOutput("metric_symbol"), style = "color:#9ea5b4; font-size:0.85rem; margin-top: 8px;"),
-            tags$div(textOutput("metric_delay"), style = "color:#748094; font-size:0.75rem; margin-top: 4px; font-style: italic;")
+            style = "padding: 10px 16px; border-right: 1px solid #1f2230;",
+            div(class = "metric-label", style = "font-size: 0.8rem;", "Live Price (INR)"),
+            div(textOutput("metric_price"), class = "metric-value", style = "margin: 8px 0; font-size: 1.6rem;"),
+            tags$div(textOutput("metric_symbol"), style = "color:#9ea5b4; font-size:0.8rem; margin-top: 6px;"),
+            tags$div(textOutput("metric_delay"), style = "color:#748094; font-size:0.7rem; margin-top: 3px; font-style: italic;")
           ),
           column(
             4,
-            style = "padding: 16px 20px; border-right: 1px solid #1f2230;",
-            div(class = "metric-label", "Daily VaR"),
-            div(textOutput("metric_var"), class = "metric-value", style = "margin: 12px 0;"),
-            tags$div(textOutput("metric_var_conf"), style = "color:#9ea5b4; font-size:0.85rem; margin-top: 8px;")
+            style = "padding: 10px 16px; border-right: 1px solid #1f2230;",
+            div(class = "metric-label", style = "font-size: 0.8rem;", "Daily VaR"),
+            div(textOutput("metric_var"), class = "metric-value", style = "margin: 8px 0; font-size: 1.6rem;"),
+            tags$div(textOutput("metric_var_conf"), style = "color:#9ea5b4; font-size:0.8rem; margin-top: 6px;")
           ),
           column(
             4,
-            style = "padding: 16px 20px;",
-            div(class = "metric-label", "Volatility (Ann.)"),
-            div(textOutput("metric_vol"), class = "metric-value", style = "margin: 12px 0;"),
-            tags$div("Last lookback window", style = "color:#9ea5b4; font-size:0.85rem; margin-top: 8px;")
+            style = "padding: 10px 16px;",
+            div(class = "metric-label", style = "font-size: 0.8rem;", "Volatility (Ann.)"),
+            div(textOutput("metric_vol"), class = "metric-value", style = "margin: 8px 0; font-size: 1.6rem;"),
+            tags$div("Last lookback window", style = "color:#9ea5b4; font-size:0.8rem; margin-top: 6px;")
           )
         )
       ),
@@ -573,12 +1145,12 @@ ui <- page_fluid(
           "Price & Returns",
           div(
             class = "card",
-            h5("Price History"),
-            plotlyOutput("price_plot", height = "320px")
+            h5("Price History", style = "margin-bottom: 10px;"),
+            plotlyOutput("price_plot", height = "280px")
           ),
           div(
             class = "card",
-            h5("Daily Returns"),
+            h5("Daily Returns", style = "margin-bottom: 10px;"),
             plotlyOutput("returns_plot", height = "280px")
           )
         ),
@@ -586,12 +1158,12 @@ ui <- page_fluid(
           "VaR & Tail Risk",
           div(
             class = "card",
-            h5("Historical VaR"),
-            plotlyOutput("var_histogram", height = "320px")
+            h5("Historical VaR", style = "margin-bottom: 10px;"),
+            plotlyOutput("var_histogram", height = "280px")
           ),
           div(
             class = "card",
-            h5("Risk Summary"),
+            h5("Risk Summary", style = "margin-bottom: 10px;"),
             tableOutput("risk_table")
           )
         ),
@@ -604,8 +1176,21 @@ ui <- page_fluid(
           ),
           div(
             class = "card",
-            h5("Simulation Snapshot"),
-            plotlyOutput("mc_paths_plot", height = "280px")
+            h5("Simulation Snapshot", style = "margin-bottom: 10px;"),
+            plotlyOutput("mc_paths_plot", height = "250px")
+          )
+        ),
+        tabPanel(
+          "Real-Time Candlestick Chart",
+          div(
+            class = "card",
+            h5("Live OHLCV Chart", style = "margin-bottom: 8px;"),
+            p(
+              style = "margin-bottom: 10px; font-size: 0.9rem;",
+              "Real-time data from: ",
+              tags$span(textOutput("chart_source"), style = "font-weight: bold; color: #00E676;")
+            ),
+            plotlyOutput("candlestick_chart", height = "500px")
           )
         ),
         tabPanel(
@@ -615,11 +1200,11 @@ ui <- page_fluid(
             style = "padding: 0; overflow: hidden;",
             div(
               id = "tradingview_widget",
-              style = "height: 600px; width: 100%; position: relative;"
+              style = "height: 500px; width: 100%; position: relative;"
             ),
             div(
               id = "tradingview_iframe",
-              style = "height: 600px; width: 100%; display: none;"
+              style = "height: 500px; width: 100%; display: none;"
             ),
             tags$script(HTML("
               var tradingViewWidget = null;
@@ -673,7 +1258,7 @@ ui <- page_fluid(
                 iframeContainer.style.display = 'block';
                 iframeContainer.innerHTML = '<iframe src=\"https://www.tradingview.com/chart/?symbol=' + 
                   encodeURIComponent('BSE:' + baseSymbol) + 
-                  '&theme=dark&interval=D\" style=\"width: 100%; height: 600px; border: none;\" frameborder=\"0\"></iframe>';
+                  '&theme=dark&interval=D\" style=\"width: 100%; height: 500px; border: none;\" frameborder=\"0\"></iframe>';
                 
                 // Also try widget approach as fallback
                 if (typeof TradingView !== 'undefined') {
@@ -692,7 +1277,7 @@ ui <- page_fluid(
                       allow_symbol_change: true,
                       container_id: 'tradingview_widget',
                       studies: ['RSI@tv-basicstudies', 'MACD@tv-basicstudies', 'Volume@tv-basicstudies'],
-                      height: 600,
+                      height: 500,
                       width: '100%'
                     });
                     // If widget loads successfully, hide iframe
@@ -780,11 +1365,13 @@ server <- function(input, output, session) {
         shiny::validate(shiny::need(FALSE, "Enter a valid equity ticker (e.g. AAPL, TSLA)."))
       }
       tryCatch({
-        # Use selected data source
+        # Use selected data source - default to Yahoo
         data_source <- if (is.null(input$data_source)) "yahoo" else input$data_source
+        
         if (data_source == "finnhub") {
           xts_obj <- fetch_equity_prices_finnhub(symbol, from, to)
         } else {
+          # Yahoo Finance (most reliable for most users)
           xts_obj <- fetch_equity_prices(symbol, from, to)
         }
         if (is.null(xts_obj) || nrow(xts_obj) == 0) {
@@ -805,7 +1392,7 @@ server <- function(input, output, session) {
         xts_obj
       }, error = function(e) {
         err_msg <- as.character(conditionMessage(e))
-        shiny::validate(shiny::need(FALSE, paste("Error fetching equity data for", symbol, ":", err_msg)))
+        shiny::validate(shiny::need(FALSE, paste("❌ Error fetching", symbol, "\n", err_msg)))
       })
     } else if (input$asset_type == "indian_equity") {
       symbol <- toupper(trimws(input$indian_equity_symbol))
@@ -817,12 +1404,11 @@ server <- function(input, output, session) {
         symbol <- paste0(symbol, ".NS")
       }
       tryCatch({
-        # Indian stocks: Use selected data source
-        data_source <- if (is.null(input$indian_data_source)) "yahoo" else input$indian_data_source
+        # Indian stocks: Use selected data source - default to Indian API (real-time)
+        data_source <- if (is.null(input$indian_data_source)) "indianapi" else input$indian_data_source
         
         if (data_source == "indianapi") {
-          # Try free real-time API (indianapi.in)
-          # Note: This API provides current price, but we still need Yahoo for historical charts
+          # Try free real-time API (indianapi.in) - provides current live prices
           xts_obj <- fetch_indian_equity_prices_realtime(symbol, from, to)
         } else {
           # Yahoo Finance (15-20 min delay, but has full historical data)
@@ -839,7 +1425,7 @@ server <- function(input, output, session) {
         xts_obj
       }, error = function(e) {
         err_msg <- as.character(conditionMessage(e))
-        shiny::validate(shiny::need(FALSE, paste("Error fetching Indian equity data for", symbol, ":", err_msg)))
+        shiny::validate(shiny::need(FALSE, paste("❌ Error fetching", symbol, "\n", err_msg)))
       })
     } else {
       symbol <- tolower(trimws(input$crypto_symbol))
@@ -858,7 +1444,11 @@ server <- function(input, output, session) {
         xts_obj
       }, error = function(e) {
         err_msg <- as.character(conditionMessage(e))
-        shiny::validate(shiny::need(FALSE, paste("Error fetching crypto data for", symbol, ":", err_msg)))
+        # Truncate very long error messages for better UI display
+        if (nchar(err_msg) > 200) {
+          err_msg <- paste0(substr(err_msg, 1, 200), "...")
+        }
+        shiny::validate(shiny::need(FALSE, paste("❌ Error fetching", symbol, "\n", err_msg)))
       })
     }
   })
@@ -905,7 +1495,9 @@ server <- function(input, output, session) {
       if (is.null(label)) label <- "Unknown"
       as.character(paste0("Asset: ", label))
     }, error = function(e) {
-      as.character(paste("Asset error:", as.character(conditionMessage(e))))
+      err <- as.character(conditionMessage(e))
+      cat("[DEBUG] metric_symbol error:", err, "\n")
+      as.character(paste("❌ Data Error:\n", err))
     })
   })
 
@@ -1049,6 +1641,92 @@ server <- function(input, output, session) {
         plot_bgcolor = "rgba(0,0,0,0)",
         showlegend = FALSE
       )
+  })
+
+  # Real-time Candlestick Chart
+  output$chart_source <- renderText({
+    asset_type <- input$asset_type
+    if (asset_type == "Equity (US)") {
+      source <- input$data_source_us
+      if (source == "finnhub") "Finnhub (Real-time)" else "Yahoo Finance (15-20 min delay)"
+    } else if (asset_type == "Equity (India)") {
+      source <- input$data_source_in
+      if (source == "indianapi") "Indian API (Real-time)" else "Yahoo Finance (15-20 min delay)"
+    } else {
+      "CoinGecko API (<1 min delay)"
+    }
+  })
+
+  output$candlestick_chart <- renderPlotly({
+    px <- price_series()
+    label <- attr(px, "asset_label", exact = TRUE)
+    if (is.null(label)) label <- "Unknown"
+
+    # Extract OHLCV data
+    tryCatch({
+      # Handle different data formats
+      has_ohlc <- all(c("Open", "High", "Low", "Close") %in% colnames(px))
+      
+      if (has_ohlc) {
+        df <- data.frame(
+          date = index(px),
+          open = as.numeric(Op(px)),
+          high = as.numeric(Hi(px)),
+          low = as.numeric(Lo(px)),
+          close = as.numeric(Cl(px)),
+          volume = if ("Volume" %in% colnames(px)) as.numeric(Vo(px)) else rep(NA, nrow(px))
+        )
+        
+        # Show only last 60 days for better detail
+        if (nrow(df) > 60) df <- tail(df, 60)
+        
+        # Determine color: green if close > open, red if close < open
+        df$color <- ifelse(df$close >= df$open, "#00E676", "#FF5252")
+        
+        # Create candlestick chart
+        plot_ly(df, x = ~date, open = ~open, high = ~high, low = ~low, close = ~close,
+                type = "candlestick",
+                increasing = list(line = list(color = "#00E676"), fillcolor = "#00E676"),
+                decreasing = list(line = list(color = "#FF5252"), fillcolor = "#FF5252")) %>%
+          layout(
+            title = list(text = paste("Real-time Candlestick Chart -", label), 
+                        font = list(color = "#ffffff", size = 14)),
+            xaxis = list(title = "", gridcolor = "#1f2230", rangeslider = list(visible = FALSE)),
+            yaxis = list(title = "Price (INR)", gridcolor = "#1f2230", tickformat = ",.0f"),
+            margin = list(l = 50, r = 20, t = 40, b = 50),
+            paper_bgcolor = "rgba(0,0,0,0)",
+            plot_bgcolor = "rgba(0,0,0,0)",
+            font = list(color = "#ffffff"),
+            hovermode = "x unified"
+          )
+      } else {
+        # Fallback: show as line chart if OHLCV not available
+        prices <- as.numeric(px[, 1])
+        df <- data.frame(time = index(px), price = prices)
+        
+        plot_ly(df, x = ~time, y = ~price, type = "scatter", mode = "lines",
+                line = list(color = "#00E676", width = 2),
+                hovertemplate = "Date: %{x}<br>Price: ₹%{y:,.2f}<extra></extra>") %>%
+          layout(
+            title = list(text = paste("Price Chart -", label), 
+                        font = list(color = "#ffffff", size = 14)),
+            xaxis = list(title = "", gridcolor = "#1f2230"),
+            yaxis = list(title = "Price (INR)", gridcolor = "#1f2230", tickformat = ",.0f"),
+            margin = list(l = 50, r = 20, t = 40, b = 50),
+            paper_bgcolor = "rgba(0,0,0,0)",
+            plot_bgcolor = "rgba(0,0,0,0)",
+            font = list(color = "#ffffff")
+          )
+      }
+    }, error = function(e) {
+      cat("Candlestick chart error:", as.character(e), "\n")
+      plot_ly() %>% add_text(x = 0.5, y = 0.5, text = paste("Chart Error:", substr(as.character(e), 1, 100)),
+                             textposition = "center",
+                             showlegend = FALSE) %>%
+        layout(xaxis = list(showgrid = FALSE, zeroline = FALSE),
+               yaxis = list(showgrid = FALSE, zeroline = FALSE),
+               paper_bgcolor = "rgba(0,0,0,0)", plot_bgcolor = "rgba(0,0,0,0)")
+    })
   })
 
   # VaR & Tail Risk
